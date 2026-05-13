@@ -1,0 +1,16 @@
+# 1. Unzip and cd into the folder
+Expand-Archive oracle_streamlit_explorer.zip -DestinationPath .
+cd oracle_streamlit_explorer
+
+# 2. Create venv and install deps
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install -r requirements.txt
+
+# 3. Configure DB credentials
+copy .streamlit\secrets.toml.example .streamlit\secrets.toml
+notepad .streamlit\secrets.toml      # fill in user/password/dsn for each env
+
+# 4. Run
+streamlit run app.py
