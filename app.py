@@ -650,19 +650,6 @@ def render_header_viewer(txn_df: pd.DataFrame) -> None:
     st.code(row["headers"], language="json")
 
 
-def render_raw_logs(txn_df: pd.DataFrame) -> None:
-    if txn_df.empty:
-        st.info("No transactions available.")
-        return
-    cid = st.selectbox("Select correlation_id", txn_df["correlation_id"].tolist(), key="raw_cid")
-    q = st.text_input("Search within raw block", key="raw_search")
-    row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
-    text = row["full_raw_block"]
-    if q:
-        st.caption(f"Matches: {text.lower().count(q.lower())}")
-    st.code(text, language="text")
-
-
 def render_export_section(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
     st.subheader("Export")
     col1, col2, col3 = st.columns(3)
@@ -776,46 +763,70 @@ def sidebar_filters(txn_df: pd.DataFrame) -> dict:
 # ---------------------------------------------------------------------------
 
 def _load_text() -> str | None:
-    """Return raw text only when the user just clicked Parse. Otherwise None."""
-    st.markdown("#### Input")
-    mode = st.radio(
-        "Source",
-        ["Upload Log File", "Paste Log Content", "Fetch From URL"],
-        horizontal=True,
-    )
-    text = ""
+    """Render the input UI inside a collapsible expander.
+
+    Returns the raw text exactly once - on the rerun when the user clicked
+    "Load & Parse" - otherwise None.
+    """
+    already_loaded = "txn_df" in st.session_state
+    with st.expander("Load logs", expanded=not already_loaded):
+        mode = st.radio(
+            "Source",
+            ["Upload Log File", "Paste Log Content", "Fetch From URL"],
+            horizontal=True,
+            key="input_mode",
+        )
+        upload_obj = None
+        paste_text = ""
+        url = ""
+        bypass = False
+
+        if mode == "Upload Log File":
+            upload_obj = st.file_uploader("Choose .log or .txt", type=["log", "txt"])
+        elif mode == "Paste Log Content":
+            paste_text = st.text_area("Paste log content", height=240, key="paste_text")
+        else:
+            url = st.text_input("Log URL", placeholder="https://example.com/app.log", key="log_url")
+            bypass = st.checkbox("Bypass SSL/certificate verification (verify=False)", key="ssl_bypass")
+            if bypass:
+                st.warning("SSL verification is disabled. Use only with trusted internal endpoints.")
+
+        col_p, col_c = st.columns([1, 1])
+        with col_p:
+            action_clicked = st.button("Load & Parse", type="primary", use_container_width=True)
+        with col_c:
+            if st.button("Clear / Reset", use_container_width=True):
+                for k in ("txn_df", "line_df"):
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+    if not action_clicked:
+        return None
+
+    # Single click handles both fetch (if URL) and read (if upload), then parse.
     if mode == "Upload Log File":
-        up = st.file_uploader("Choose .log or .txt", type=["log", "txt"])
-        if up is not None:
-            text = read_uploaded_file(up)
-    elif mode == "Paste Log Content":
-        text = st.text_area("Paste log content", height=240)
-    else:
-        url = st.text_input("Log URL", placeholder="https://example.com/app.log")
-        bypass = st.checkbox("Bypass SSL/certificate verification (verify=False)")
-        if bypass:
-            st.warning("SSL verification is disabled. Use only with trusted internal endpoints.")
-        if url and st.button("Fetch"):
-            try:
-                fetched = fetch_log_from_url(url, verify_ssl=not bypass)
-                st.session_state["fetched_text"] = fetched
-                st.success(f"Fetched {len(fetched):,} characters.")
-            except requests.RequestException as e:
-                st.error(f"Fetch failed: {e}")
-            except Exception as e:
-                st.error(f"Unexpected error: {e}")
-        text = st.session_state.get("fetched_text", text)
+        if upload_obj is None:
+            st.error("Choose a file first.")
+            return None
+        return read_uploaded_file(upload_obj)
 
-    col_p, col_c = st.columns([1, 1])
-    with col_p:
-        parse_clicked = st.button("Parse", type="primary", use_container_width=True)
-    with col_c:
-        if st.button("Clear / Reset", use_container_width=True):
-            for k in ("fetched_text", "txn_df", "line_df"):
-                st.session_state.pop(k, None)
-            st.rerun()
+    if mode == "Paste Log Content":
+        if not paste_text.strip():
+            st.error("Paste log content first.")
+            return None
+        return paste_text
 
-    return text if parse_clicked and text else None
+    # URL mode
+    if not url.strip():
+        st.error("Enter a URL first.")
+        return None
+    try:
+        return fetch_log_from_url(url, verify_ssl=not bypass)
+    except requests.RequestException as e:
+        st.error(f"Fetch failed: {e}")
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
+    return None
 
 
 def main() -> None:
@@ -853,8 +864,6 @@ def main() -> None:
                 f"Parsed {size_mb:.1f} MB in {elapsed:.1f}s - "
                 f"{len(log_rows):,} log lines, {len(txns):,} transactions."
             )
-        # Free the raw text once parsed so 100 MB doesn't sit in session_state.
-        st.session_state.pop("fetched_text", None)
 
     txn_df = st.session_state.get("txn_df")
     line_df = st.session_state.get("line_df")
@@ -875,18 +884,20 @@ def main() -> None:
         "advanced": filters.get("advanced"),
     })
 
-    tabs = st.tabs([
-        "Overview", "Transactions", "Log Lines", "Raw Logs", "Export",
-    ])
-    with tabs[0]:
+    # Radio-as-tabs persists the active view across reruns (st.tabs resets
+    # to the first tab whenever a child widget like a selectbox changes).
+    views = ["Overview", "Transactions", "Log Lines", "Export"]
+    view = st.radio("View", views, horizontal=True, key="active_view",
+                    label_visibility="collapsed")
+    st.divider()
+
+    if view == "Overview":
         render_overview(f_txn, f_line)
-    with tabs[1]:
+    elif view == "Transactions":
         render_transactions(f_txn)
-    with tabs[2]:
+    elif view == "Log Lines":
         render_log_lines(f_line)
-    with tabs[3]:
-        render_raw_logs(f_txn)
-    with tabs[4]:
+    elif view == "Export":
         render_export_section(f_txn, f_line)
 
 
