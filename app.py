@@ -723,13 +723,17 @@ def render_overview(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
 
 
 def render_transactions(txn_df: pd.DataFrame) -> None:
+    # In-tab search rendered for UX; the actual filtering happens in main()
+    # so the Export view sees the same filtered dataframe.
+    st.text_input("Search transactions", key="txn_search",
+                  placeholder="Filters this view and exports - searches across "
+                              "correlation_id, api, uri, method, channel, headers, "
+                              "request/response payloads")
     if txn_df.empty:
-        st.info("No transactions to display.")
+        st.info("No transactions match the current filters.")
         return
     summary_cols = ["correlation_id", "timestamp", "api", "uri", "method", "channel", "http_status", "duration_ms"]
 
-    # Header row: count + inline export. CSV excludes the multi-MB raw block
-    # column so generation is near-instant even on 100 MB inputs.
     head_l, head_r = st.columns([3, 1])
     with head_l:
         st.caption(f"{len(txn_df):,} transactions")
@@ -740,12 +744,24 @@ def render_transactions(txn_df: pd.DataFrame) -> None:
             file_name="transactions.csv",
             mime="text/csv",
             use_container_width=True,
+            key="dl_txn_inline",
         )
 
     st.dataframe(txn_df[summary_cols], use_container_width=True, hide_index=True)
 
     st.markdown("### Inspect transaction")
-    cid = st.selectbox("Select correlation_id", txn_df["correlation_id"].tolist(), key="txn_inspect")
+    insp_l, insp_r = st.columns([3, 2])
+    with insp_l:
+        cid = st.selectbox("Select correlation_id", txn_df["correlation_id"].tolist(),
+                           key="txn_inspect")
+    with insp_r:
+        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        st.checkbox(
+            "Use this correlation_id as export scope",
+            key="txn_inspect_pin",
+            help="When on, the Export view includes only this transaction "
+                 "and its log lines.",
+        )
     row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
 
     with st.expander("Headers (cleaned JSON)", expanded=False):
@@ -854,27 +870,45 @@ def _prepared_card(label: str, description: str, prepare_key: str,
 def render_export_section(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
     st.subheader("Export filtered data")
     st.caption(
-        "Every export below respects the sidebar filters and the in-tab "
-        "log-lines search. Heavy exports use a Prepare step so the page "
+        "Every export below respects the sidebar filters, the in-tab search "
+        "boxes, and (if enabled) the pinned correlation_id from the "
+        "Transactions view. Heavy exports use a Prepare step so the page "
         "stays responsive - click Prepare once, then Download."
     )
 
-    # Show the active filters so the user can verify what will be exported.
-    active = []
+    # Apply pinned correlation_id from Transactions inspect, if any.
+    pin = bool(st.session_state.get("txn_inspect_pin"))
+    pinned_cid = st.session_state.get("txn_inspect")
+    pin_active = False
+    if pin and pinned_cid and not txn_df.empty:
+        cid_set = set(txn_df["correlation_id"].astype(str))
+        if str(pinned_cid) in cid_set:
+            txn_df = txn_df[txn_df["correlation_id"].astype(str) == str(pinned_cid)]
+            line_df = line_df[line_df["correlation_id"].astype(str) == str(pinned_cid)]
+            pin_active = True
+
+    # Active filter summary.
+    active: list[str] = []
+    if pin_active:
+        active.append(f"pinned correlation_id = '{pinned_cid}'")
+    txn_q = (st.session_state.get("txn_search") or "").strip()
+    if txn_q:
+        active.append(f"transactions search = '{txn_q}'")
     line_q = (st.session_state.get("line_search") or "").strip()
     if line_q:
         active.append(f"log-line search = '{line_q}'")
-    sidebar_kw = (st.session_state.get("global_keyword") or "").strip() if False else ""
-    # (sidebar filter values aren't all in session_state, so we just show the
-    # filtered counts which already reflect them.)
 
     n_txn = len(txn_df)
     n_line = len(line_df)
     c1, c2 = st.columns(2)
     c1.metric("Filtered transactions", f"{n_txn:,}")
     c2.metric("Filtered log lines", f"{n_line:,}")
+    if pin_active:
+        st.success(f"Scoped to a single transaction: **{pinned_cid}**. "
+                   "Turn off 'Use this correlation_id as export scope' on the "
+                   "Transactions view to export the broader set.")
     if active:
-        st.info("Active in-tab filter: " + "; ".join(active))
+        st.info("Active in-tab filters: " + "; ".join(active))
     st.divider()
 
     # --- Fast direct downloads (no Prepare step needed) -------------------
@@ -984,17 +1018,17 @@ def render_header_viewer(txn_df: pd.DataFrame) -> None:
 def sidebar_filters(txn_df: pd.DataFrame) -> dict:
     st.sidebar.header("Filters")
     filters: dict = {}
-    filters["keyword"] = st.sidebar.text_input("Global keyword search")
+    filters["keyword"] = st.sidebar.text_input("Global keyword search", key="flt_keyword")
 
     with st.sidebar.expander("Column filters", expanded=False):
         if not txn_df.empty:
-            filters["correlation_id"] = st.text_input("correlation_id contains")
-            filters["api"] = st.multiselect("api", sorted(txn_df["api"].dropna().unique().tolist()))
-            filters["component"] = st.text_input("component contains")
-            filters["uri"] = st.text_input("uri contains")
-            filters["method"] = st.multiselect("method", sorted(txn_df["method"].dropna().unique().tolist()))
-            filters["channel"] = st.multiselect("channel", sorted(txn_df["channel"].dropna().unique().tolist()))
-            filters["http_status"] = st.multiselect("http_status", sorted(txn_df["http_status"].dropna().astype(str).unique().tolist()))
+            filters["correlation_id"] = st.text_input("correlation_id contains", key="flt_cid")
+            filters["api"] = st.multiselect("api", sorted(txn_df["api"].dropna().unique().tolist()), key="flt_api")
+            filters["component"] = st.text_input("component contains", key="flt_component")
+            filters["uri"] = st.text_input("uri contains", key="flt_uri")
+            filters["method"] = st.multiselect("method", sorted(txn_df["method"].dropna().unique().tolist()), key="flt_method")
+            filters["channel"] = st.multiselect("channel", sorted(txn_df["channel"].dropna().unique().tolist()), key="flt_channel")
+            filters["http_status"] = st.multiselect("http_status", sorted(txn_df["http_status"].dropna().astype(str).unique().tolist()), key="flt_status")
 
             tsa, tsb = st.columns(2)
             with tsa:
@@ -1008,13 +1042,13 @@ def sidebar_filters(txn_df: pd.DataFrame) -> dict:
                 lo, hi = int(dur_series.min()), int(dur_series.max())
                 if lo == hi:
                     hi = lo + 1
-                rng = st.slider("duration_ms", lo, hi, (lo, hi))
+                rng = st.slider("duration_ms", lo, hi, (lo, hi), key="flt_duration")
                 filters["duration_range"] = rng
 
     with st.sidebar.expander("Section search", expanded=False):
-        filters["headers_search"] = st.text_input("Search in headers")
-        filters["request_payload_search"] = st.text_input("Search in request payload")
-        filters["response_payload_search"] = st.text_input("Search in response payload")
+        filters["headers_search"] = st.text_input("Search in headers", key="flt_hdr_search")
+        filters["request_payload_search"] = st.text_input("Search in request payload", key="flt_req_search")
+        filters["response_payload_search"] = st.text_input("Search in response payload", key="flt_resp_search")
 
     with st.sidebar.expander("Advanced filter builder", expanded=False):
         logic = st.radio("Combine with", ["AND", "OR"], horizontal=True, key="adv_logic")
@@ -1126,6 +1160,12 @@ def main() -> None:
         "by correlation_id."
     )
 
+    # Pre-seed in-tab search keys so their values survive when the owning
+    # view unmounts (Streamlit can drop unkeyed widget state on view switch).
+    for k in ("txn_search", "line_search"):
+        st.session_state.setdefault(k, "")
+    st.session_state.setdefault("txn_inspect_pin", False)
+
     text_to_parse = _load_text()
 
     if text_to_parse:
@@ -1164,8 +1204,8 @@ def main() -> None:
         "advanced": filters.get("advanced"),
     })
 
-    # Apply the in-tab "Search log lines" box at the global level so the
-    # Log Lines view and the Export view see the same filtered rows.
+    # Apply in-tab search boxes at the global level so every view (and the
+    # Export view) sees the same filtered rows.
     line_q = (st.session_state.get("line_search") or "").strip()
     if line_q and not f_line.empty:
         kw = line_q.lower()
@@ -1173,6 +1213,10 @@ def main() -> None:
         for c in f_line.columns:
             mask |= f_line[c].astype(str).str.lower().str.contains(kw, regex=False, na=False)
         f_line = f_line[mask]
+
+    txn_q = (st.session_state.get("txn_search") or "").strip()
+    if txn_q and not f_txn.empty:
+        f_txn = f_txn[_keyword_mask(f_txn, txn_q)]
 
     # Radio-as-tabs persists the active view across reruns (st.tabs resets
     # to the first tab whenever a child widget like a selectbox changes).
