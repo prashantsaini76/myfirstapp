@@ -722,47 +722,119 @@ def render_overview(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
     st.dataframe(slow, use_container_width=True, hide_index=True)
 
 
+_SUMMARY_COLS = ["correlation_id", "timestamp", "api", "uri", "method",
+                 "channel", "http_status", "duration_ms"]
+
+
+def _df_sig(df: pd.DataFrame) -> str:
+    """Cheap fingerprint of a dataframe slice for session-state cache keys."""
+    if df.empty:
+        return "empty"
+    return f"{len(df)}_{df['correlation_id'].iat[0]}_{df['correlation_id'].iat[-1]}"
+
+
+def _payload_csv_bytes(df: pd.DataFrame) -> bytes:
+    """CSV: correlation_id, headers, request_payload, response_payload, curl."""
+    out = pd.DataFrame({
+        "correlation_id": df["correlation_id"].values,
+        "headers": df["headers"].values,
+        "request_payload": df["request_payload"].values,
+        "response_payload": df["response_payload"].values,
+        "curl": df.apply(build_curl, axis=1).values if not df.empty else [],
+    })
+    return out.to_csv(index=False).encode("utf-8")
+
+
+def _lazy_download(label: str, key: str, sig: str, builder, file_name: str,
+                   mime: str = "text/csv", spinner_text: str = "Generating...") -> None:
+    """Prepare-then-download in a single visual slot.
+
+    First click runs `builder()` under a spinner and stashes the bytes.
+    After that the button morphs into a real download_button labelled with
+    the prepared size. Cache invalidates when `sig` changes.
+    """
+    state_key = f"_lazydl::{key}::{sig}"
+    if state_key in st.session_state:
+        size_mb = len(st.session_state[state_key]) / 1e6
+        st.download_button(
+            f"{label}  ({size_mb:.1f} MB ready)",
+            data=st.session_state[state_key],
+            file_name=file_name,
+            mime=mime,
+            use_container_width=True,
+            key=f"dlbtn_{key}_{sig}",
+        )
+    else:
+        if st.button(label, use_container_width=True, key=f"prep_{key}_{sig}"):
+            with st.spinner(spinner_text):
+                st.session_state[state_key] = builder()
+            st.rerun()
+
+
 def render_transactions(txn_df: pd.DataFrame) -> None:
-    # In-tab search rendered for UX; the actual filtering happens in main()
-    # so the Export view sees the same filtered dataframe.
-    st.text_input("Search transactions", key="txn_search",
-                  placeholder="Filters this view and exports - searches across "
-                              "correlation_id, api, uri, method, channel, headers, "
-                              "request/response payloads")
     if txn_df.empty:
         st.info("No transactions match the current filters.")
         return
-    summary_cols = ["correlation_id", "timestamp", "api", "uri", "method", "channel", "http_status", "duration_ms"]
 
-    head_l, head_r = st.columns([3, 1])
-    with head_l:
-        st.caption(f"{len(txn_df):,} transactions")
-    with head_r:
+    # Single dropdown drives both the summary table and the inspect section.
+    cids = txn_df["correlation_id"].tolist()
+    sel = st.selectbox("Select correlation_id", cids, key="txn_inspect")
+    sel_df = txn_df[txn_df["correlation_id"].astype(str) == str(sel)]
+
+    # Action row above the summary table.
+    b1, b2 = st.columns(2)
+    with b1:
         st.download_button(
-            "Download CSV",
-            data=txn_df[summary_cols + ["component"]].to_csv(index=False).encode("utf-8"),
-            file_name="transactions.csv",
+            "Download full transaction summary",
+            data=txn_df[_SUMMARY_COLS + ["component"]].to_csv(index=False).encode("utf-8"),
+            file_name="transactions_summary_full.csv",
             mime="text/csv",
             use_container_width=True,
-            key="dl_txn_inline",
+            key="dl_txn_full",
+        )
+    with b2:
+        st.download_button(
+            "Download filtered transaction summary",
+            data=sel_df[_SUMMARY_COLS + ["component"]].to_csv(index=False).encode("utf-8"),
+            file_name=f"transaction_summary_{sel}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_txn_filtered",
+            disabled=sel_df.empty,
         )
 
-    st.dataframe(txn_df[summary_cols], use_container_width=True, hide_index=True)
+    st.dataframe(sel_df[_SUMMARY_COLS], use_container_width=True, hide_index=True)
 
+    # --- Inspect transaction --------------------------------------------
     st.markdown("### Inspect transaction")
-    insp_l, insp_r = st.columns([3, 2])
-    with insp_l:
-        cid = st.selectbox("Select correlation_id", txn_df["correlation_id"].tolist(),
-                           key="txn_inspect")
-    with insp_r:
-        st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
-        st.checkbox(
-            "Use this correlation_id as export scope",
-            key="txn_inspect_pin",
-            help="When on, the Export view includes only this transaction "
-                 "and its log lines.",
+    st.caption(f"Showing details for correlation_id: **{sel}**")
+
+    p1, p2 = st.columns(2)
+    with p1:
+        st.download_button(
+            "Download current payload data",
+            data=_payload_csv_bytes(sel_df),
+            file_name=f"payload_{sel}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_payload_current",
+            help="CSV with headers, request payload, response payload and curl "
+                 "for the selected correlation_id.",
+            disabled=sel_df.empty,
         )
-    row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
+    with p2:
+        _lazy_download(
+            label="Download whole payload data",
+            key="payload_full",
+            sig=_df_sig(txn_df),
+            builder=lambda: _payload_csv_bytes(txn_df),
+            file_name="payloads_all.csv",
+            spinner_text=f"Building payload CSV for {len(txn_df):,} transactions...",
+        )
+
+    if sel_df.empty:
+        return
+    row = sel_df.iloc[0]
 
     with st.expander("Headers (cleaned JSON)", expanded=False):
         st.code(row["headers"], language="json")
@@ -776,215 +848,48 @@ def render_transactions(txn_df: pd.DataFrame) -> None:
 
 
 def render_log_lines(line_df: pd.DataFrame) -> None:
-    # In-tab search is rendered for UX feedback, but the actual filtering
-    # happens in main() so Export sees the same filtered dataset.
-    st.text_input("Search log lines", key="line_search",
-                  placeholder="Filters this view and exports")
     if line_df.empty:
         st.info("No log lines match the current filters.")
         return
-    df = line_df
+
+    cid_values = (line_df["correlation_id"].dropna().astype(str)
+                  .replace("", pd.NA).dropna().unique().tolist())
+    cid_values.sort()
+    if not cid_values:
+        st.warning("No correlation_id values were associated with the log lines.")
+        return
+
+    sel = st.selectbox("Select correlation_id", cid_values, key="line_cid")
+    sel_df = line_df[line_df["correlation_id"].astype(str) == str(sel)]
+
+    b1, b2 = st.columns(2)
+    with b1:
+        _lazy_download(
+            label="Download whole data",
+            key="lines_full",
+            sig=f"lines_{len(line_df)}",
+            builder=lambda: line_df.to_csv(index=False).encode("utf-8"),
+            file_name="log_lines_full.csv",
+            spinner_text=f"Building CSV for {len(line_df):,} log lines...",
+        )
+    with b2:
+        st.download_button(
+            "Download filtered data",
+            data=sel_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"log_lines_{sel}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_lines_filtered",
+            disabled=sel_df.empty,
+        )
 
     MAX_ROWS = 5000
-    total = len(df)
-
-    head_l, head_r = st.columns([3, 1])
-    with head_l:
-        if total > MAX_ROWS:
-            st.caption(f"Showing first {MAX_ROWS:,} of {total:,} rows. Refine the search to narrow down.")
-        else:
-            st.caption(f"{total:,} rows")
-    with head_r:
-        # Export the full filtered set (not just the displayed slice).
-        st.download_button(
-            "Download CSV",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name="log_lines.csv",
-            mime="text/csv",
-            use_container_width=True,
-            disabled=df.empty,
-        )
-
-    st.dataframe(df.head(MAX_ROWS), use_container_width=True, hide_index=True)
-
-
-# ---------------------------------------------------------------------------
-# Export
-# ---------------------------------------------------------------------------
-
-_TXN_SUMMARY_COLS = [
-    "correlation_id", "timestamp", "api", "uri", "method", "channel",
-    "http_status", "duration_ms", "component",
-]
-
-
-def _csv_bytes(df: pd.DataFrame, cols: list[str] | None = None) -> bytes:
-    src = df[cols] if cols else df
-    return src.to_csv(index=False).encode("utf-8")
-
-
-def _excel_bytes(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        txn_df[_TXN_SUMMARY_COLS].to_excel(writer, index=False, sheet_name="transactions")
-        line_df.to_excel(writer, index=False, sheet_name="log_lines")
-    return buf.getvalue()
-
-
-def _prepared_card(label: str, description: str, prepare_key: str,
-                   builder, file_name: str, mime: str, disabled: bool) -> None:
-    """Two-step export card: Prepare -> Download. Heavy work runs only on click."""
-    st.markdown(f"**{label}**")
-    st.caption(description)
-
-    bytes_key = f"_export_bytes_{prepare_key}"
-    size_key = f"_export_size_{prepare_key}"
-
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        if st.button("Prepare", key=f"btn_{prepare_key}", disabled=disabled,
-                     use_container_width=True):
-            with st.spinner("Preparing export..."):
-                data = builder()
-            st.session_state[bytes_key] = data
-            st.session_state[size_key] = len(data)
-    with col_b:
-        if bytes_key in st.session_state:
-            st.download_button(
-                "Download",
-                data=st.session_state[bytes_key],
-                file_name=file_name,
-                mime=mime,
-                key=f"dl_{prepare_key}",
-                use_container_width=True,
-            )
-        else:
-            st.button("Download", key=f"dl_disabled_{prepare_key}",
-                      disabled=True, use_container_width=True)
-
-    if size_key in st.session_state:
-        st.caption(f"Ready: {st.session_state[size_key] / 1e6:.2f} MB")
-    st.markdown("")
-
-
-def render_export_section(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
-    st.subheader("Export filtered data")
-    st.caption(
-        "Every export below respects the sidebar filters, the in-tab search "
-        "boxes, and (if enabled) the pinned correlation_id from the "
-        "Transactions view. Heavy exports use a Prepare step so the page "
-        "stays responsive - click Prepare once, then Download."
-    )
-
-    # Apply pinned correlation_id from Transactions inspect, if any.
-    pin = bool(st.session_state.get("txn_inspect_pin"))
-    pinned_cid = st.session_state.get("txn_inspect")
-    pin_active = False
-    if pin and pinned_cid and not txn_df.empty:
-        cid_set = set(txn_df["correlation_id"].astype(str))
-        if str(pinned_cid) in cid_set:
-            txn_df = txn_df[txn_df["correlation_id"].astype(str) == str(pinned_cid)]
-            line_df = line_df[line_df["correlation_id"].astype(str) == str(pinned_cid)]
-            pin_active = True
-
-    # Active filter summary.
-    active: list[str] = []
-    if pin_active:
-        active.append(f"pinned correlation_id = '{pinned_cid}'")
-    txn_q = (st.session_state.get("txn_search") or "").strip()
-    if txn_q:
-        active.append(f"transactions search = '{txn_q}'")
-    line_q = (st.session_state.get("line_search") or "").strip()
-    if line_q:
-        active.append(f"log-line search = '{line_q}'")
-
-    n_txn = len(txn_df)
-    n_line = len(line_df)
-    c1, c2 = st.columns(2)
-    c1.metric("Filtered transactions", f"{n_txn:,}")
-    c2.metric("Filtered log lines", f"{n_line:,}")
-    if pin_active:
-        st.success(f"Scoped to a single transaction: **{pinned_cid}**. "
-                   "Turn off 'Use this correlation_id as export scope' on the "
-                   "Transactions view to export the broader set.")
-    if active:
-        st.info("Active in-tab filters: " + "; ".join(active))
-    st.divider()
-
-    # --- Fast direct downloads (no Prepare step needed) -------------------
-    st.markdown("#### Quick CSV exports")
-    quick_l, quick_r = st.columns(2)
-    with quick_l:
-        st.markdown("**Transactions (summary)**")
-        st.caption("One row per correlation_id with the standard summary columns.")
-        st.download_button(
-            "Download CSV",
-            data=_csv_bytes(txn_df, _TXN_SUMMARY_COLS) if not txn_df.empty else b"",
-            file_name="transactions.csv",
-            mime="text/csv",
-            disabled=txn_df.empty,
-            use_container_width=True,
-            key="dl_txn_summary",
-        )
-    with quick_r:
-        st.markdown("**Log lines**")
-        st.caption("Individual parsed log lines from the current filter.")
-        st.download_button(
-            "Download CSV",
-            data=_csv_bytes(line_df) if not line_df.empty else b"",
-            file_name="log_lines.csv",
-            mime="text/csv",
-            disabled=line_df.empty,
-            use_container_width=True,
-            key="dl_line_csv",
-        )
-
-    st.divider()
-
-    # --- Heavy / on-demand exports (Prepare -> Download) ------------------
-    st.markdown("#### Complete exports")
-
-    _prepared_card(
-        label="Transactions with full raw blocks (CSV)",
-        description="Includes headers JSON, request/response payloads and the "
-                    "full raw transaction block. Large files - generate only when needed.",
-        prepare_key="txn_full",
-        builder=lambda: _csv_bytes(txn_df),
-        file_name="transactions_full.csv",
-        mime="text/csv",
-        disabled=txn_df.empty,
-    )
-
-    _prepared_card(
-        label="Workbook (Excel)",
-        description="Two sheets: transactions summary + log lines. Excel "
-                    "generation is the slowest format - use CSV unless Excel is required.",
-        prepare_key="xlsx",
-        builder=lambda: _excel_bytes(txn_df, line_df),
-        file_name="api_logs.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=txn_df.empty and line_df.empty,
-    )
-
-    # --- Single transaction raw block (always fast) -----------------------
-    st.divider()
-    st.markdown("#### Single transaction")
-    if txn_df.empty:
-        st.caption("No transactions match the current filter.")
+    total = len(sel_df)
+    if total > MAX_ROWS:
+        st.caption(f"Showing first {MAX_ROWS:,} of {total:,} rows for {sel}.")
     else:
-        cid = st.selectbox(
-            "Select correlation_id",
-            txn_df["correlation_id"].tolist(),
-            key="export_single_cid",
-        )
-        row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
-        st.download_button(
-            "Download raw block (TXT)",
-            data=row["full_raw_block"].encode("utf-8"),
-            file_name=f"{cid}.txt",
-            mime="text/plain",
-            key="dl_single_raw",
-        )
+        st.caption(f"{total:,} rows for {sel}")
+    st.dataframe(sel_df.head(MAX_ROWS), use_container_width=True, hide_index=True)
 
 
 def render_payload_viewer(txn_df: pd.DataFrame) -> None:
@@ -1160,11 +1065,6 @@ def main() -> None:
         "by correlation_id."
     )
 
-    # Pre-seed in-tab search keys so their values survive when the owning
-    # view unmounts (Streamlit can drop unkeyed widget state on view switch).
-    for k in ("txn_search", "line_search"):
-        st.session_state.setdefault(k, "")
-    st.session_state.setdefault("txn_inspect_pin", False)
 
     text_to_parse = _load_text()
 
@@ -1204,23 +1104,10 @@ def main() -> None:
         "advanced": filters.get("advanced"),
     })
 
-    # Apply in-tab search boxes at the global level so every view (and the
-    # Export view) sees the same filtered rows.
-    line_q = (st.session_state.get("line_search") or "").strip()
-    if line_q and not f_line.empty:
-        kw = line_q.lower()
-        mask = pd.Series(False, index=f_line.index)
-        for c in f_line.columns:
-            mask |= f_line[c].astype(str).str.lower().str.contains(kw, regex=False, na=False)
-        f_line = f_line[mask]
-
-    txn_q = (st.session_state.get("txn_search") or "").strip()
-    if txn_q and not f_txn.empty:
-        f_txn = f_txn[_keyword_mask(f_txn, txn_q)]
 
     # Radio-as-tabs persists the active view across reruns (st.tabs resets
     # to the first tab whenever a child widget like a selectbox changes).
-    views = ["Overview", "Transactions", "Log Lines", "Export"]
+    views = ["Overview", "Transactions", "Log Lines"]
     view = st.radio("View", views, horizontal=True, key="active_view",
                     label_visibility="collapsed")
     st.divider()
@@ -1231,8 +1118,6 @@ def main() -> None:
         render_transactions(f_txn)
     elif view == "Log Lines":
         render_log_lines(f_line)
-    elif view == "Export":
-        render_export_section(f_txn, f_line)
 
 
 # Note: to allow >200 MB uploads, run with:
