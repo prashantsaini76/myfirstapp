@@ -760,17 +760,14 @@ def render_transactions(txn_df: pd.DataFrame) -> None:
 
 
 def render_log_lines(line_df: pd.DataFrame) -> None:
+    # In-tab search is rendered for UX feedback, but the actual filtering
+    # happens in main() so Export sees the same filtered dataset.
+    st.text_input("Search log lines", key="line_search",
+                  placeholder="Filters this view and exports")
     if line_df.empty:
-        st.info("No log lines parsed.")
+        st.info("No log lines match the current filters.")
         return
-    q = st.text_input("Search log lines", key="line_search")
     df = line_df
-    if q:
-        kw = q.lower()
-        mask = pd.Series(False, index=df.index)
-        for c in df.columns:
-            mask |= df[c].astype(str).str.lower().str.contains(kw, regex=False, na=False)
-        df = df[mask]
 
     MAX_ROWS = 5000
     total = len(df)
@@ -857,16 +854,27 @@ def _prepared_card(label: str, description: str, prepare_key: str,
 def render_export_section(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
     st.subheader("Export filtered data")
     st.caption(
-        "Filters from the sidebar apply to every export below. "
-        "Heavy exports use a Prepare step so the page stays responsive - click "
-        "Prepare once, then Download."
+        "Every export below respects the sidebar filters and the in-tab "
+        "log-lines search. Heavy exports use a Prepare step so the page "
+        "stays responsive - click Prepare once, then Download."
     )
+
+    # Show the active filters so the user can verify what will be exported.
+    active = []
+    line_q = (st.session_state.get("line_search") or "").strip()
+    if line_q:
+        active.append(f"log-line search = '{line_q}'")
+    sidebar_kw = (st.session_state.get("global_keyword") or "").strip() if False else ""
+    # (sidebar filter values aren't all in session_state, so we just show the
+    # filtered counts which already reflect them.)
 
     n_txn = len(txn_df)
     n_line = len(line_df)
     c1, c2 = st.columns(2)
     c1.metric("Filtered transactions", f"{n_txn:,}")
     c2.metric("Filtered log lines", f"{n_line:,}")
+    if active:
+        st.info("Active in-tab filter: " + "; ".join(active))
     st.divider()
 
     # --- Fast direct downloads (no Prepare step needed) -------------------
@@ -1155,6 +1163,16 @@ def main() -> None:
         "ts_range": filters.get("ts_range"),
         "advanced": filters.get("advanced"),
     })
+
+    # Apply the in-tab "Search log lines" box at the global level so the
+    # Log Lines view and the Export view see the same filtered rows.
+    line_q = (st.session_state.get("line_search") or "").strip()
+    if line_q and not f_line.empty:
+        kw = line_q.lower()
+        mask = pd.Series(False, index=f_line.index)
+        for c in f_line.columns:
+            mask |= f_line[c].astype(str).str.lower().str.contains(kw, regex=False, na=False)
+        f_line = f_line[mask]
 
     # Radio-as-tabs persists the active view across reruns (st.tabs resets
     # to the first tab whenever a child widget like a selectbox changes).
