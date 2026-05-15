@@ -178,6 +178,49 @@ def clean_headers(headers: dict[str, str]) -> dict[str, str]:
     return cleaned
 
 
+# Headers that shouldn't be part of a replay curl (curl/the network sets them).
+_CURL_SKIP_HEADERS = {
+    "host", "content-length", "connection", "accept-encoding",
+    "x-forwarded-host", "x-forwarded-port", "x-forwarded-prefix",
+    "x-forwarded-proto", "baggage",
+}
+
+
+def _shell_single_quote(s: str) -> str:
+    """Escape an arbitrary string for safe single-quoted shell inclusion."""
+    return s.replace("'", "'\\''")
+
+
+def build_curl(txn_row) -> str:
+    """Build a copy-pasteable curl command from a transaction row."""
+    method = (txn_row.get("method") or "GET").upper()
+
+    try:
+        headers = json.loads(txn_row.get("headers") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        headers = {}
+
+    # Pick host + scheme from the original request headers where possible.
+    host = headers.get("host") or headers.get("Host") or "<host>"
+    proto_raw = headers.get("x-forwarded-proto") or headers.get("X-Forwarded-Proto") or "https"
+    proto = proto_raw.split(",")[0].strip() or "https"
+
+    uri = txn_row.get("uri") or "/"
+    url = f"{proto}://{host}{uri}"
+
+    parts = [f"curl -X {method} '{_shell_single_quote(url)}'"]
+    for k, v in headers.items():
+        if k.lower() in _CURL_SKIP_HEADERS:
+            continue
+        parts.append(f"  -H '{_shell_single_quote(k)}: {_shell_single_quote(str(v))}'")
+
+    payload = (txn_row.get("request_payload") or "").strip()
+    if payload and method not in ("GET", "HEAD"):
+        parts.append(f"  --data '{_shell_single_quote(payload)}'")
+
+    return " \\\n".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # Request / Response extraction
 # ---------------------------------------------------------------------------
@@ -508,78 +551,175 @@ def apply_filters(df: pd.DataFrame, filters: dict) -> pd.DataFrame:
 # Rendering
 # ---------------------------------------------------------------------------
 
-def _safe_metric(label: str, value: Any) -> None:
-    st.metric(label, "-" if value in ("", None) else value)
+_CARD_PALETTE = {
+    "neutral": ("#0f172a", "#94a3b8"),
+    "info":    ("#1d4ed8", "#3b82f6"),
+    "success": ("#15803d", "#22c55e"),
+    "warning": ("#a16207", "#eab308"),
+    "danger":  ("#b91c1c", "#ef4444"),
+}
 
 
-def render_kpis(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
-    total_lines = len(line_df)
-    total_txns = len(txn_df)
-    unique_cid = txn_df["correlation_id"].nunique() if not txn_df.empty else 0
-    total_apis = txn_df["api"].nunique() if not txn_df.empty else 0
+def _card(title: str, value: str, sub: str | None = None, tone: str = "neutral") -> str:
+    text_c, accent = _CARD_PALETTE.get(tone, _CARD_PALETTE["neutral"])
+    sub_html = (
+        f'<div style="color:#64748b;font-size:0.72rem;margin-top:6px;'
+        f'white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="{sub}">{sub}</div>'
+        if sub else '<div style="height:14px"></div>'
+    )
+    return (
+        '<div style="background:#ffffff;border:1px solid #e2e8f0;border-left:4px solid '
+        f'{accent};border-radius:8px;padding:14px 16px;height:100%;'
+        'box-shadow:0 1px 2px rgba(15,23,42,0.04)">'
+        f'<div style="color:#64748b;font-size:0.7rem;font-weight:600;'
+        f'text-transform:uppercase;letter-spacing:0.06em">{title}</div>'
+        f'<div style="color:{text_c};font-size:1.55rem;font-weight:700;margin-top:6px;'
+        'line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" '
+        f'title="{value}">{value}</div>'
+        f'{sub_html}</div>'
+    )
 
-    status_series = pd.to_numeric(txn_df["http_status"], errors="coerce") if not txn_df.empty else pd.Series([], dtype=float)
-    error_count = int((status_series.fillna(0) >= 400).sum()) if not txn_df.empty else 0
 
-    dur_series = pd.to_numeric(txn_df["duration_ms"], errors="coerce") if not txn_df.empty else pd.Series([], dtype=float)
-    avg_dur = round(dur_series.dropna().mean(), 2) if not dur_series.dropna().empty else 0
-    slowest = int(dur_series.dropna().max()) if not dur_series.dropna().empty else 0
-
-    top_api = txn_df["api"].mode().iat[0] if not txn_df.empty and not txn_df["api"].mode().empty else ""
-    top_uri = txn_df["uri"].mode().iat[0] if not txn_df.empty and not txn_df["uri"].mode().empty else ""
-    top_status = txn_df["http_status"].mode().iat[0] if not txn_df.empty and not txn_df["http_status"].mode().empty else ""
-
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: _safe_metric("Total log lines", total_lines)
-    with c2: _safe_metric("Total transactions", total_txns)
-    with c3: _safe_metric("Unique correlation IDs", unique_cid)
-    with c4: _safe_metric("Total APIs", total_apis)
-    with c5: _safe_metric("Errors (>=400)", error_count)
-
-    c6, c7, c8, c9, c10 = st.columns(5)
-    with c6: _safe_metric("Avg duration (ms)", avg_dur)
-    with c7: _safe_metric("Slowest (ms)", slowest)
-    with c8: _safe_metric("Top API", top_api)
-    with c9: _safe_metric("Top URI", top_uri)
-    with c10: _safe_metric("Top HTTP status", top_status)
+def _fmt_ms(v: float) -> str:
+    if v is None or pd.isna(v):
+        return "-"
+    v = float(v)
+    if v >= 1000:
+        return f"{v/1000:.2f} s"
+    return f"{v:.0f} ms"
 
 
 def render_overview(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
-    render_kpis(txn_df, line_df)
     if txn_df.empty:
-        st.info("No transactions parsed yet.")
+        st.info("No transactions match the current filters.")
         return
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("HTTP status distribution")
-        s = txn_df["http_status"].replace("", pd.NA).dropna().value_counts()
-        if not s.empty:
-            st.bar_chart(s)
+    # --- aggregates ------------------------------------------------------
+    n_txn = len(txn_df)
+    n_lines = len(line_df)
+    unique_cid = txn_df["correlation_id"].nunique()
+    n_apis = txn_df["api"].replace("", pd.NA).dropna().nunique()
+
+    status_num = pd.to_numeric(txn_df["http_status"], errors="coerce")
+    valid_status = status_num.dropna()
+    errors = int((valid_status >= 400).sum()) if not valid_status.empty else 0
+    success_rate = (
+        ((valid_status < 400).sum() / len(valid_status) * 100)
+        if not valid_status.empty else 100.0
+    )
+
+    dur = pd.to_numeric(txn_df["duration_ms"], errors="coerce").dropna()
+    avg_ms = float(dur.mean()) if not dur.empty else 0.0
+    p50 = float(dur.quantile(0.50)) if not dur.empty else 0.0
+    p95 = float(dur.quantile(0.95)) if not dur.empty else 0.0
+    p99 = float(dur.quantile(0.99)) if not dur.empty else 0.0
+    slowest = float(dur.max()) if not dur.empty else 0.0
+
+    ts = pd.to_datetime(txn_df["timestamp"], errors="coerce").dropna()
+    if not ts.empty:
+        time_range = f"{ts.min():%Y-%m-%d %H:%M:%S}  to  {ts.max():%Y-%m-%d %H:%M:%S}"
+    else:
+        time_range = "Time range unavailable"
+
+    # --- health hero -----------------------------------------------------
+    if errors > 0:
+        health_tone, health_label = "danger", f"{errors:,} error{'s' if errors != 1 else ''}"
+    elif p95 > 2000:
+        health_tone, health_label = "warning", "Elevated latency"
+    else:
+        health_tone, health_label = "success", "Healthy"
+
+    h1, h2, h3, h4 = st.columns([2, 1, 1, 1])
+    h1.markdown(_card("Status", health_label, time_range, health_tone), unsafe_allow_html=True)
+    h2.markdown(_card("Transactions", f"{n_txn:,}", f"{n_lines:,} log lines", "info"),
+                unsafe_allow_html=True)
+    h3.markdown(_card("Success rate", f"{success_rate:.1f}%",
+                       f"{errors:,} non-2xx/3xx" if errors else "All requests succeeded",
+                       "success" if errors == 0 else "warning"),
+                unsafe_allow_html=True)
+    h4.markdown(_card("Avg duration", _fmt_ms(avg_ms),
+                       f"slowest {_fmt_ms(slowest)}", "neutral"),
+                unsafe_allow_html=True)
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # --- latency / volume strip ------------------------------------------
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.markdown(_card("Unique CIDs", f"{unique_cid:,}"), unsafe_allow_html=True)
+    k2.markdown(_card("APIs", f"{n_apis:,}"), unsafe_allow_html=True)
+    k3.markdown(_card("p50 latency", _fmt_ms(p50)), unsafe_allow_html=True)
+    k4.markdown(_card("p95 latency", _fmt_ms(p95),
+                       tone="warning" if p95 > 1000 else "neutral"),
+                unsafe_allow_html=True)
+    k5.markdown(_card("p99 latency", _fmt_ms(p99),
+                       tone="warning" if p99 > 2000 else "neutral"),
+                unsafe_allow_html=True)
+    k6.markdown(_card("Max latency", _fmt_ms(slowest)), unsafe_allow_html=True)
+
+    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
+    st.divider()
+
+    # --- charts row ------------------------------------------------------
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("##### HTTP status distribution")
+        if not valid_status.empty:
+            buckets = pd.cut(
+                valid_status.astype(int),
+                bins=[100, 200, 300, 400, 500, 600],
+                labels=["1xx", "2xx", "3xx", "4xx", "5xx"],
+                right=False,
+            )
+            sd = buckets.value_counts().sort_index()
+            st.bar_chart(sd, height=260, color="#3b82f6")
         else:
             st.caption("No HTTP status values found.")
 
-        st.subheader("API-wise transaction count")
-        a = txn_df["api"].replace("", pd.NA).dropna().value_counts()
-        if not a.empty:
-            st.bar_chart(a)
+    with c2:
+        st.markdown("##### Latency distribution")
+        if not dur.empty:
+            bins = [0, 50, 100, 250, 500, 1000, 2500, 5000, 10000, max(10001, int(dur.max()) + 1)]
+            labels = ["<50ms", "50-100", "100-250", "250-500",
+                      "500ms-1s", "1-2.5s", "2.5-5s", "5-10s", ">10s"]
+            d_buckets = pd.cut(dur, bins=bins, labels=labels, right=False)
+            dd = d_buckets.value_counts().reindex(labels).fillna(0).astype(int)
+            st.bar_chart(dd, height=260, color="#22c55e")
+        else:
+            st.caption("No duration values.")
 
-    with col_b:
-        st.subheader("Slowest transactions")
-        dur = pd.to_numeric(txn_df["duration_ms"], errors="coerce")
-        slow = txn_df.assign(_d=dur).sort_values("_d", ascending=False).head(10)
-        st.dataframe(
-            slow[["correlation_id", "api", "uri", "method", "http_status", "duration_ms"]],
-            use_container_width=True, hide_index=True,
-        )
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
 
-        st.subheader("Top URIs")
-        u = txn_df["uri"].replace("", pd.NA).dropna().value_counts().head(10).rename_axis("uri").reset_index(name="count")
-        st.dataframe(u, use_container_width=True, hide_index=True)
+    # --- top tables row --------------------------------------------------
+    t1, t2 = st.columns(2)
+    with t1:
+        st.markdown("##### Top APIs by volume")
+        api_counts = (txn_df["api"].replace("", pd.NA).dropna().value_counts().head(10))
+        if not api_counts.empty:
+            api_df = api_counts.rename_axis("api").reset_index(name="transactions")
+            st.dataframe(api_df, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.caption("No API values.")
 
-        st.subheader("Top components")
-        c = txn_df["component"].replace("", pd.NA).dropna().value_counts().head(10).rename_axis("component").reset_index(name="count")
-        st.dataframe(c, use_container_width=True, hide_index=True)
+    with t2:
+        st.markdown("##### Top URIs")
+        uri_counts = (txn_df["uri"].replace("", pd.NA).dropna().value_counts().head(10))
+        if not uri_counts.empty:
+            uri_df = uri_counts.rename_axis("uri").reset_index(name="transactions")
+            st.dataframe(uri_df, use_container_width=True, hide_index=True, height=300)
+        else:
+            st.caption("No URI values.")
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+
+    # --- slowest transactions -------------------------------------------
+    st.markdown("##### Slowest transactions")
+    dur_col = pd.to_numeric(txn_df["duration_ms"], errors="coerce")
+    slow = (
+        txn_df.assign(_d=dur_col)
+        .sort_values("_d", ascending=False)
+        .head(10)[["correlation_id", "api", "uri", "method", "http_status", "duration_ms"]]
+    )
+    st.dataframe(slow, use_container_width=True, hide_index=True)
 
 
 def render_transactions(txn_df: pd.DataFrame) -> None:
@@ -614,15 +754,9 @@ def render_transactions(txn_df: pd.DataFrame) -> None:
         st.code(row["request_payload"] or "(empty)", language="json")
     with st.expander("Response payload", expanded=False):
         st.code(row["response_payload"] or "(empty)", language="json")
-    with st.expander("Raw block", expanded=False):
-        st.code(row["full_raw_block"], language="text")
-        st.download_button(
-            "Download this transaction (TXT)",
-            data=row["full_raw_block"].encode("utf-8"),
-            file_name=f"{cid}.txt",
-            mime="text/plain",
-            key="dl_raw_txt",
-        )
+    with st.expander("cURL command", expanded=False):
+        st.caption("Hover the snippet and click the copy icon at the top right.")
+        st.code(build_curl(row), language="bash")
 
 
 def render_log_lines(line_df: pd.DataFrame) -> None:
@@ -659,6 +793,156 @@ def render_log_lines(line_df: pd.DataFrame) -> None:
         )
 
     st.dataframe(df.head(MAX_ROWS), use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+_TXN_SUMMARY_COLS = [
+    "correlation_id", "timestamp", "api", "uri", "method", "channel",
+    "http_status", "duration_ms", "component",
+]
+
+
+def _csv_bytes(df: pd.DataFrame, cols: list[str] | None = None) -> bytes:
+    src = df[cols] if cols else df
+    return src.to_csv(index=False).encode("utf-8")
+
+
+def _excel_bytes(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        txn_df[_TXN_SUMMARY_COLS].to_excel(writer, index=False, sheet_name="transactions")
+        line_df.to_excel(writer, index=False, sheet_name="log_lines")
+    return buf.getvalue()
+
+
+def _prepared_card(label: str, description: str, prepare_key: str,
+                   builder, file_name: str, mime: str, disabled: bool) -> None:
+    """Two-step export card: Prepare -> Download. Heavy work runs only on click."""
+    st.markdown(f"**{label}**")
+    st.caption(description)
+
+    bytes_key = f"_export_bytes_{prepare_key}"
+    size_key = f"_export_size_{prepare_key}"
+
+    col_a, col_b = st.columns([1, 1])
+    with col_a:
+        if st.button("Prepare", key=f"btn_{prepare_key}", disabled=disabled,
+                     use_container_width=True):
+            with st.spinner("Preparing export..."):
+                data = builder()
+            st.session_state[bytes_key] = data
+            st.session_state[size_key] = len(data)
+    with col_b:
+        if bytes_key in st.session_state:
+            st.download_button(
+                "Download",
+                data=st.session_state[bytes_key],
+                file_name=file_name,
+                mime=mime,
+                key=f"dl_{prepare_key}",
+                use_container_width=True,
+            )
+        else:
+            st.button("Download", key=f"dl_disabled_{prepare_key}",
+                      disabled=True, use_container_width=True)
+
+    if size_key in st.session_state:
+        st.caption(f"Ready: {st.session_state[size_key] / 1e6:.2f} MB")
+    st.markdown("")
+
+
+def render_export_section(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
+    st.subheader("Export filtered data")
+    st.caption(
+        "Filters from the sidebar apply to every export below. "
+        "Heavy exports use a Prepare step so the page stays responsive - click "
+        "Prepare once, then Download."
+    )
+
+    n_txn = len(txn_df)
+    n_line = len(line_df)
+    c1, c2 = st.columns(2)
+    c1.metric("Filtered transactions", f"{n_txn:,}")
+    c2.metric("Filtered log lines", f"{n_line:,}")
+    st.divider()
+
+    # --- Fast direct downloads (no Prepare step needed) -------------------
+    st.markdown("#### Quick CSV exports")
+    quick_l, quick_r = st.columns(2)
+    with quick_l:
+        st.markdown("**Transactions (summary)**")
+        st.caption("One row per correlation_id with the standard summary columns.")
+        st.download_button(
+            "Download CSV",
+            data=_csv_bytes(txn_df, _TXN_SUMMARY_COLS) if not txn_df.empty else b"",
+            file_name="transactions.csv",
+            mime="text/csv",
+            disabled=txn_df.empty,
+            use_container_width=True,
+            key="dl_txn_summary",
+        )
+    with quick_r:
+        st.markdown("**Log lines**")
+        st.caption("Individual parsed log lines from the current filter.")
+        st.download_button(
+            "Download CSV",
+            data=_csv_bytes(line_df) if not line_df.empty else b"",
+            file_name="log_lines.csv",
+            mime="text/csv",
+            disabled=line_df.empty,
+            use_container_width=True,
+            key="dl_line_csv",
+        )
+
+    st.divider()
+
+    # --- Heavy / on-demand exports (Prepare -> Download) ------------------
+    st.markdown("#### Complete exports")
+
+    _prepared_card(
+        label="Transactions with full raw blocks (CSV)",
+        description="Includes headers JSON, request/response payloads and the "
+                    "full raw transaction block. Large files - generate only when needed.",
+        prepare_key="txn_full",
+        builder=lambda: _csv_bytes(txn_df),
+        file_name="transactions_full.csv",
+        mime="text/csv",
+        disabled=txn_df.empty,
+    )
+
+    _prepared_card(
+        label="Workbook (Excel)",
+        description="Two sheets: transactions summary + log lines. Excel "
+                    "generation is the slowest format - use CSV unless Excel is required.",
+        prepare_key="xlsx",
+        builder=lambda: _excel_bytes(txn_df, line_df),
+        file_name="api_logs.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=txn_df.empty and line_df.empty,
+    )
+
+    # --- Single transaction raw block (always fast) -----------------------
+    st.divider()
+    st.markdown("#### Single transaction")
+    if txn_df.empty:
+        st.caption("No transactions match the current filter.")
+    else:
+        cid = st.selectbox(
+            "Select correlation_id",
+            txn_df["correlation_id"].tolist(),
+            key="export_single_cid",
+        )
+        row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
+        st.download_button(
+            "Download raw block (TXT)",
+            data=row["full_raw_block"].encode("utf-8"),
+            file_name=f"{cid}.txt",
+            mime="text/plain",
+            key="dl_single_raw",
+        )
 
 
 def render_payload_viewer(txn_df: pd.DataFrame) -> None:
@@ -874,7 +1158,7 @@ def main() -> None:
 
     # Radio-as-tabs persists the active view across reruns (st.tabs resets
     # to the first tab whenever a child widget like a selectbox changes).
-    views = ["Overview", "Transactions", "Log Lines"]
+    views = ["Overview", "Transactions", "Log Lines", "Export"]
     view = st.radio("View", views, horizontal=True, key="active_view",
                     label_visibility="collapsed")
     st.divider()
@@ -885,6 +1169,8 @@ def main() -> None:
         render_transactions(f_txn)
     elif view == "Log Lines":
         render_log_lines(f_line)
+    elif view == "Export":
+        render_export_section(f_txn, f_line)
 
 
 # Note: to allow >200 MB uploads, run with:
