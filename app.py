@@ -587,6 +587,21 @@ def render_transactions(txn_df: pd.DataFrame) -> None:
         st.info("No transactions to display.")
         return
     summary_cols = ["correlation_id", "timestamp", "api", "uri", "method", "channel", "http_status", "duration_ms"]
+
+    # Header row: count + inline export. CSV excludes the multi-MB raw block
+    # column so generation is near-instant even on 100 MB inputs.
+    head_l, head_r = st.columns([3, 1])
+    with head_l:
+        st.caption(f"{len(txn_df):,} transactions")
+    with head_r:
+        st.download_button(
+            "Download CSV",
+            data=txn_df[summary_cols + ["component"]].to_csv(index=False).encode("utf-8"),
+            file_name="transactions.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
     st.dataframe(txn_df[summary_cols], use_container_width=True, hide_index=True)
 
     st.markdown("### Inspect transaction")
@@ -601,6 +616,13 @@ def render_transactions(txn_df: pd.DataFrame) -> None:
         st.code(row["response_payload"] or "(empty)", language="json")
     with st.expander("Raw block", expanded=False):
         st.code(row["full_raw_block"], language="text")
+        st.download_button(
+            "Download this transaction (TXT)",
+            data=row["full_raw_block"].encode("utf-8"),
+            file_name=f"{cid}.txt",
+            mime="text/plain",
+            key="dl_raw_txt",
+        )
 
 
 def render_log_lines(line_df: pd.DataFrame) -> None:
@@ -618,12 +640,25 @@ def render_log_lines(line_df: pd.DataFrame) -> None:
 
     MAX_ROWS = 5000
     total = len(df)
-    if total > MAX_ROWS:
-        st.caption(f"Showing first {MAX_ROWS:,} of {total:,} rows. Refine the search to narrow down.")
-        df = df.head(MAX_ROWS)
-    else:
-        st.caption(f"{total:,} rows")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    head_l, head_r = st.columns([3, 1])
+    with head_l:
+        if total > MAX_ROWS:
+            st.caption(f"Showing first {MAX_ROWS:,} of {total:,} rows. Refine the search to narrow down.")
+        else:
+            st.caption(f"{total:,} rows")
+    with head_r:
+        # Export the full filtered set (not just the displayed slice).
+        st.download_button(
+            "Download CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name="log_lines.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=df.empty,
+        )
+
+    st.dataframe(df.head(MAX_ROWS), use_container_width=True, hide_index=True)
 
 
 def render_payload_viewer(txn_df: pd.DataFrame) -> None:
@@ -648,53 +683,6 @@ def render_header_viewer(txn_df: pd.DataFrame) -> None:
     cid = st.selectbox("Select correlation_id", txn_df["correlation_id"].tolist(), key="hdr_cid")
     row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
     st.code(row["headers"], language="json")
-
-
-def render_export_section(txn_df: pd.DataFrame, line_df: pd.DataFrame) -> None:
-    st.subheader("Export")
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.download_button(
-            "Download filtered transactions (CSV)",
-            data=txn_df.to_csv(index=False).encode("utf-8"),
-            file_name="transactions.csv",
-            mime="text/csv",
-            disabled=txn_df.empty,
-        )
-        st.download_button(
-            "Download filtered log lines (CSV)",
-            data=line_df.to_csv(index=False).encode("utf-8"),
-            file_name="log_lines.csv",
-            mime="text/csv",
-            disabled=line_df.empty,
-        )
-
-    with col2:
-        if not txn_df.empty:
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                txn_df.drop(columns=["full_raw_block"], errors="ignore").to_excel(
-                    writer, index=False, sheet_name="transactions"
-                )
-                line_df.to_excel(writer, index=False, sheet_name="log_lines")
-            st.download_button(
-                "Download transaction summary (Excel)",
-                data=buf.getvalue(),
-                file_name="transactions.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    with col3:
-        if not txn_df.empty:
-            cid = st.selectbox("Raw block for", txn_df["correlation_id"].tolist(), key="export_cid")
-            row = txn_df[txn_df["correlation_id"] == cid].iloc[0]
-            st.download_button(
-                "Download raw block (TXT)",
-                data=row["full_raw_block"].encode("utf-8"),
-                file_name=f"{cid}.txt",
-                mime="text/plain",
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +874,7 @@ def main() -> None:
 
     # Radio-as-tabs persists the active view across reruns (st.tabs resets
     # to the first tab whenever a child widget like a selectbox changes).
-    views = ["Overview", "Transactions", "Log Lines", "Export"]
+    views = ["Overview", "Transactions", "Log Lines"]
     view = st.radio("View", views, horizontal=True, key="active_view",
                     label_visibility="collapsed")
     st.divider()
@@ -897,8 +885,6 @@ def main() -> None:
         render_transactions(f_txn)
     elif view == "Log Lines":
         render_log_lines(f_line)
-    elif view == "Export":
-        render_export_section(f_txn, f_line)
 
 
 # Note: to allow >200 MB uploads, run with:
